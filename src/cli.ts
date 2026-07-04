@@ -12,10 +12,13 @@ import {
   createVerifySettings,
   createTrustSettings,
   mergeSettings,
-  type Manifest,
-  type Settings,
-  type ValidationStatus,
+  type SettingsContext,
 } from "@contentauth/c2pa-node";
+import type {
+  Manifest,
+  ManifestStore,
+  ValidationStatus,
+} from "@contentauth/c2pa-types";
 
 /**
  * The exit codes the CLI can return.
@@ -40,15 +43,6 @@ class CliError extends Error {
     super(message);
     this.name = "CliError";
   }
-}
-
-/**
- * Subset of the JSON returned by `Reader.json()` that this CLI consumes.
- */
-interface ManifestStore {
-  active_manifest?: string;
-  manifests: Record<string, Manifest>;
-  validation_status: ValidationStatus[];
 }
 
 interface VerifyArgs {
@@ -108,7 +102,7 @@ Options:
 `);
 }
 
-function buildSettings(args: VerifyArgs): Settings {
+function buildSettings(args: VerifyArgs): SettingsContext {
   const verify = createVerifySettings({
     verifyAfterReading: true,
     verifyTrust: true,
@@ -134,8 +128,12 @@ const color = {
 
 /**
  * Validation status codes that should cause the command to fail.
+ *
+ * The array is `as const` so the entries stay narrow literal types; the
+ * set itself is widened to `ReadonlySet<string>` so `has()` accepts the
+ * `string` we get off a `ValidationStatus`.
  */
-const FATAL_CODES = new Set([
+const FATAL_CODES: ReadonlySet<string> = new Set([
   "signingCredential.untrusted",
   "signingCredential.invalid",
   "assertion.hardBindingMissing",
@@ -188,17 +186,26 @@ function printStatus(s: ValidationStatus): "fatal" | "ok" {
 async function main(): Promise<ExitCode> {
   const argv = process.argv.slice(2);
 
+  // Strip the leading subcommand. Only `verify` exists today; future
+  // subcommands can extend this branch.
+  const argvAfterCmd = argv[0] === "verify" ? argv.slice(1) : argv;
+
   try {
     // Keep help out of parseVerify so it stays strict.
-    if (argv.includes("--help") || argv.includes("-h")) {
+    if (argvAfterCmd.includes("--help") || argvAfterCmd.includes("-h")) {
       printHelp();
       return ExitCode.Success;
     }
 
-    const args = parseVerify(argv);
+    const args = parseVerify(argvAfterCmd);
     const path = resolve(args.file);
 
-    const reader = await Reader.fromAsset(path, buildSettings(args));
+    const reader = await Reader.fromAsset({ path }, buildSettings(args));
+
+    if (reader === null) {
+      console.error(`${color.yellow}No C2PA manifest found in ${path}${color.reset}`);
+      return ExitCode.NoManifest;
+    }
 
     if (!reader.isEmbedded() && !reader.remoteUrl()) {
       console.error(`${color.yellow}No C2PA manifest found in ${path}${color.reset}`);
@@ -213,11 +220,12 @@ async function main(): Promise<ExitCode> {
     }
 
     const store = reader.json() as ManifestStore;
-    for (const [label, m] of Object.entries(store.manifests)) {
+    const manifests = store.manifests ?? {};
+    for (const [label, m] of Object.entries(manifests)) {
       printManifest(label, m, label === store.active_manifest);
     }
 
-    const statuses = store.validation_status;
+    const statuses = store.validation_status ?? [];
     console.log(
       `\nValidation (${statuses.length} entr${statuses.length === 1 ? "y" : "ies"}):`,
     );
